@@ -1,0 +1,273 @@
+---
+title: "How to Data Science with Weather"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This data science pipeline tutorial will be using weather event data from [here[1]]( https://www.kaggle.com/sobhanmoosavi/us-weather-events/version/1 ).This dataset contains the type, time, and location of recorded weather events in 49 US states from 2016 and 2019. After downloading the dataset in your working directory, the following code will allow you to use it in R. You can find the Federal Aviation Administration's airport weather station locations and data [here[2]](https://www.faa.gov/air_traffic/weather/asos/).
+
+```{r Data Curation Part 1, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(lubridate)
+library(randomForest)
+set.seed(0518)
+# loading code goes here
+weather_tab <- read_csv( file = "US_WeatherEvents_2016-2019.csv" )
+# display dataframe
+weather_tab
+```
+
+As you can see the dataset contains 5,059,833 entities ( weather events ) and 13 attributes. 
+EventId: Identifier for event | Data Type <chr> | no transformation required  
+
+Type: Weather type of event | Data Type <chr> | As an unordered categorical attribute we will want to transform into R factor
+[ Snow, Fog, Cold, Storm, Rain, Precipitation, Hail  ]  
+
+Severity: Severity of event | Data Type <chr> | As an ordered categorical attribute we will want to transform into R factor, additionally removing UNK and Other classifications should make order more clear 
+[ Light, Moderate, Heavy, Severe, UNK, Other ]  
+
+StartTime(UTC): Datetime of event start in  UTC | Data Type <S3: POSIXct> (datetime) | we will remove "(UTC)" to avoid being mistaken for a function  
+
+EndTime(UTC): Datetime of event end in  UTC | Data Type <S3: POSIXct> (datetime) | we will remove "(UTC)" to avoid being mistaken for a function  
+
+TimeZone: US time zone of event | Data Type <chr> | As an unordered categorical attribute we will want to transform into R factor  
+
+AirportCode: Airport weather station that reported event | Data Type <chr> | no transformation required  
+
+LocationLat: Latitude of reporting airport weather station | Data Type <double> | no transformation required  
+
+LocationLng: Latitude of reporting airport weather station | Data Type <double> | no transformation required  
+
+City: City of reporting airport weather station | Data Type <chr> | no transformation required  
+
+County: County of reporting  airport weather station | Data Type <chr> | no transformation required  
+
+State: State of reporting  airport weather station | Data Type <chr> | no transformation required  
+
+Zipcode: Zip code of reporting  airport weather station | Data Type <chr> | no transformation required  
+
+We will now perform some operations to improve data usability.
+
+```{r Data Curation Part 2, message=FALSE, warning=FALSE }
+# Perform data transformations to improve usability of weather data
+transformed_weather_tab <- weather_tab %>%
+  # remove events with unknown or other severity classifcation
+  filter( Severity != "UNK" & Severity != "Other" ) %>%
+  # factorize Type, Severity, and Timezone
+  mutate( Type = as.factor( Type ), Severity = factor( x = Severity, levels = c( "Light", "Moderate", "Heavy", "Severe" ) ), TimeZone = as.factor( TimeZone ) ) %>%
+  # rename datetimes
+  mutate( StartTime = `StartTime(UTC)`, EndTime = `EndTime(UTC)` ) %>%
+  select( -`StartTime(UTC)`, -`EndTime(UTC)` )
+# display 
+transformed_weather_tab
+```
+
+As the address of the reporting airport weather stations are constant, we will want to tidy the data by separating the table into a weather event table and reporting weather station table.
+
+```{r Data Curation Part 3, message=FALSE, warning=FALSE  }
+# create airport weather station table
+airport_station_tab <- transformed_weather_tab %>%
+  # remove non-airport information
+  select( -EventId, -Type, -Severity, -StartTime, -EndTime, -TimeZone )
+airport_station_tab %>%
+  # only unique entities
+  unique()
+# display
+airport_station_tab
+
+# length of unique AirportCodes is the same as the number of unqiue entities in table, Airport code can function as primary key
+length( unique( airport_station_tab$AirportCode ) )
+
+# remove airport fields excpet AirportCode from weather table
+transformed_weather_tab <- transformed_weather_tab %>%
+  select( EventId, Type, Severity, StartTime, EndTime, TimeZone, AirportCode )
+# display
+transformed_weather_tab
+
+```
+
+Let's look at the breakdown of weather events by type.
+
+```{r Exploratory Data Analysis Part 1, message=FALSE, warning=FALSE }
+# plot duration vs start datetime as scatter plot
+transformed_weather_tab %>%
+  # start datetime as x-axis, end datetime as y-axis
+  ggplot( aes( Type ) ) +
+  # scatter plot
+  geom_bar()
+```
+
+We can see the rain is by far the most frequent type of weather event for the data set. What would be even more useful is if we could separate the data by month so we could comment on trends over time. This is all leading up to weather prediction which is important for saving lives and property. [National Oceanic and Atmospheric Administration's[3]](https://www.noaa.gov/weather) website is a good place to start for those curious about the ramifications of severe weather.
+
+```{r Exploratory Data Analysis Part 3, message=FALSE, warning=FALSE }
+# break down by year
+transformed_weather_tab$year <- format( transformed_weather_tab$StartTime, "%Y" )
+# break down by month
+transformed_weather_tab$month <- factor( format( transformed_weather_tab$StartTime, "%b" ), levels = c( "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" ) )
+```
+
+```{r Exploratory Data Analysis Part 2, message=FALSE, warning=FALSE }
+# break down by year
+transformed_weather_tab %>%
+  # start month as x-axis, number of events on y-axis
+  ggplot( aes( x = month, fill = Type ) ) +
+  # break into different graphs by year
+  facet_grid( year~. ) +
+  # bar plot
+  geom_bar( )
+```
+
+Now we can see monthly variations in the number and type of weather events recorded. In the winter, we can see that snow can be as common as rain (which makes intuitive sense), but this result was obscured when we were simply looking at the frequency over the entire data set. These sorts of visualizations help us better understand the data and give us insight into what might give useful analysis.
+
+We will be testing a simple hypothesis. We will hypothesis and then test whether the true average duration of light rain weather events is less than 1.25 hours or slightly over our sample mean. We want to be 90% confident that we are correct. That is randomly sampling and taking the mean of those samples we would expect the sample mean to be less than 1.25 hours. That is our null hypothesis should be $H_0: \bar{X} >= 1.25$ with confidence level $\alpha = 0.1$. Before we go out testing this we will want to get a sense over whether the Central Limit Theorem (CLT) can be reasonably applied in this situation.
+
+```{r Hypothesis Testing Part 1, message=FALSE, warning=FALSE }
+# duration of weather event in hours
+transformed_weather_tab$duration <- as.numeric( transformed_weather_tab$EndTime - transformed_weather_tab$StartTime ) / 3600
+
+# create new data frame just for light rain
+light_rain_tab <- transformed_weather_tab %>%
+  filter( Type == "Rain" & Severity == "Light" )
+light_rain_tab
+
+# mean of light rean duration in hours
+light_rain_mean_duration <- mean( light_rain_tab $duration )
+light_rain_mean_duration
+# standard deviation of light rain duration in hours
+light_rain_sd_duration <- sd( light_rain_tab $duration )
+light_rain_sd_duration
+
+# plot distribution of durations for light rain using histogram
+light_rain_tab %>%
+# exclude values more than three sample standard deviations from the histogram for ease of viewing  
+  filter( light_rain_mean_duration + 3 * light_rain_sd_duration >= duration & light_rain_mean_duration - 3 * light_rain_sd_duration <= duration) %>%
+  # duration as data
+  ggplot( aes( x = duration ) ) +
+  # histogram with 20 bins
+  geom_histogram()
+```
+
+As can be seen above there is some level of skew in duration ( durations cannot be less than 0 hr after all ), but for such a large set of data CLT can be assumed to be valid. We will than use our knowledge of the sample mean and standard deviation to approximate $P( \bar{X} >= 1.25 )$ as $1 - \phi(z)$ for $z = \frac{ 1.25-\mu }{ se(X) }$.
+
+
+```{r Hypothesis Testing Part 2, message=FALSE, warning=FALSE }
+# standard error of light rain duration in hours
+light_rain_se_duration = light_rain_sd_duration / sqrt( length( light_rain_tab$duration ) )
+# probability that the null hypotheses is true
+1 - pnorm( 1.25, mean = light_rain_mean_duration, sd = light_rain_se_duration )
+```
+
+$P( \bar{X} >= 1.25 ) <= \alpha$, so we reject the null hypothesis. We use this to confirm our original hypothesis that the mean was less than 1.25 hours.
+
+Now we will attempt to predict an outcome. Let's see if we can predict whether a given event will last more than one hour. First we will plot duration conditioned on several variables we believe to be promising to see whether there is any relation
+
+
+```{r Machine Learning to Provide Analysis Part 1, message=FALSE, warning=FALSE }
+# time dividing true and false
+bound = 1
+
+# whether duration greater than bound
+transformed_weather_tab$overBound = transformed_weather_tab$duration > bound
+
+# plot mean event weather duration conditioned on year
+transformed_weather_tab %>%
+  # condition on year
+  group_by( year ) %>%
+  # get mean duration
+  summarize( mean_duration = mean( duration ) ) %>%
+  # year on x-axis, mean duration on x-axis
+  ggplot( aes( x = year, y = mean_duration ) ) +
+  # scatter plot
+  geom_point()
+
+# plot mean event weather duration conditioned on month
+transformed_weather_tab %>%
+  # condition on month
+  group_by( month ) %>%
+  # get mean duration
+  summarize( mean_duration = mean( duration ) ) %>%
+  # month on x-axis, mean duration on x-axis
+  ggplot( aes( x = month, y = mean_duration ) ) +
+  # scatter plot
+  geom_point()
+
+# plot mean event weather duration conditioned on type
+transformed_weather_tab %>%
+  # condition on type
+  group_by( Type ) %>%
+  # get mean duration
+  summarize( mean_duration = mean( duration ) ) %>%
+  # type on x-axis, duration on x-axis
+  ggplot( aes( x = Type, y = mean_duration ) ) +
+  # bar plot
+  geom_bar( stat = "identity")
+
+# plot mean event weather duration conditioned on severity
+transformed_weather_tab %>%
+  # condition on month
+  group_by( Severity ) %>%
+  # get mean duration
+  summarize( mean_duration = mean( duration ) ) %>%
+  # month on x-axis, mean duration on x-axis
+  ggplot( aes( x = Severity, y = mean_duration ) ) +
+  # bar plot
+  geom_bar( stat = "identity")
+
+
+```
+
+We can see that for year, month, type, and severity there is some sort of relation between these values and duration. Unfortunately this does not seem to be linear relation, so we will attempt to create a random forest to predict whether the duration for a given event will exceed 1 hour. 
+
+
+```{r Machine Learning to Provide Analysis Part 2, message=FALSE, warning=FALSE }
+# randomly determine indices of training set
+train_indices <- sample(nrow(transformed_weather_tab), nrow(transformed_weather_tab)/1E3 )
+# traing set we will use to make model
+train_set <- transformed_weather_tab[train_indices,]
+# testing set which we will use to judge the predictive capabilities of the model
+test_set <- transformed_weather_tab[-train_indices,]
+
+# create a random forest using year, month, type, and severity to predict whether an event will last longer than 1 hour
+weather_rf <- randomForest( overBound~year+month+Type+Severity, importance=TRUE, mtry=4, data=train_set)
+
+# view importance of variables in creating random forest forest
+variable_importance <- importance(weather_rf)
+knitr::kable(head(round(variable_importance, digits=2)))
+
+# using random forest model on testing set predict outcome
+pred <- predict( weather_rf, test_set )
+# probability of over 0.5 is considered to be TRUE, else FALSE
+pred_bool <- ifelse( pred > 0.5, TRUE, FALSE )
+
+# table of number of all four possible outcomes ( True Positive, False Positive, True Negative, False Negative )
+count_table <- table( prediction = pred_bool, obervation = test_set$overBound )
+# make table proportions
+prop_table <- count_table / sum( count_table  )
+prop_table
+
+# False Positive Rate
+FPR <- prop_table[2] / sum( prop_table[1:2] )
+FPR
+# True Positive Rate
+TPR <- prop_table[4] / sum( prop_table[3:4] )
+TPR
+# Positive Prediction Value
+PPV <- prop_table[4] / sum( prop_table[c( 2, 4)] )
+PPV
+# Negative Prediction Value
+NPV <- prop_table[3] / sum( prop_table[c( 1, 3)] )
+NPV
+```
+
+
+As we can see, the random forest we created was actually very bad at predicting whether a weather event would last more than one hour. Weather is notoriously chaotic, so there is little surprise that such a simple model would be particularly accurate. The only thing this model is any good at is correctly predicting a weather event would be shorter than one hour. Even this is not particulary great. Real weather forecasts use much more complex models. If you want to know more about weather prediction models and their importance this [statement[4]](https://www.ametsoc.org/index.cfm/ams/about-ams/ams-statements/statements-of-the-ams-in-force/weather-analysis-and-forecasting/) by the American Meteorological Society is a good resource.  
+
+Citations )  
+[1] Moosavi, Sobhan, Mohammad Hossein Samavatian, Arnab Nandi, Srinivasan Parthasarathy, and Rajiv Ramnath. “Short and Long-term Pattern Discovery Over Large-Scale Geo-Spatiotemporal Data.” In Proceedings of the 25th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, ACM, 2019.  
+[2] Surface Weather Observation Stations. (2016, December 16). Retrieved from https://www.faa.gov/air_traffic/weather/asos/  
+[3] Weather. (n.d.). Retrieved from https://www.noaa.gov/weather  
+[4] Weather Analysis and Forecasting. (n.d.). Retrieved from https://www.ametsoc.org/index.cfm/ams/about-ams/ams-statements/statements-of-the-ams-in-force/weather-analysis-and-forecasting/
